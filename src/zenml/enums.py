@@ -71,7 +71,7 @@ class StackComponentType(StrEnum):
 class StoreType(StrEnum):
     """Repository Store Backend Types."""
 
-    LOCAL = "local"
+    LOCAL = "local"  # Deprecated; Use `StoreType.SQL` instead.
     SQL = "sql"
     REST = "rest"
 

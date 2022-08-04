@@ -42,7 +42,7 @@ def get_default_store_type() -> StoreType:
 
     The default store type can be set via the environment variable
     ZENML_DEFAULT_STORE_TYPE. If this variable is not set, the default
-    store type is set to 'LOCAL'.
+    store type is set to 'SQL'.
 
     NOTE: this is a global function instead of a default
     `ProfileConfiguration.store_type` value because it makes it easier to mock
@@ -54,7 +54,7 @@ def get_default_store_type() -> StoreType:
     store_type = os.getenv(ENV_ZENML_DEFAULT_STORE_TYPE)
     if store_type and store_type in StoreType.values():
         return StoreType(store_type)
-    return StoreType.LOCAL
+    return StoreType.SQL
 
 
 class ProfileConfiguration(BaseModel):

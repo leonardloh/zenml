@@ -474,6 +474,6 @@ Running with active profile: 'zenml' (global)
 ┃   👉   │ local      │ default        │ default        │ default      ┃
 ┗━━━━━━━━┷━━━━━━━━━━━━┷━━━━━━━━━━━━━━━━┷━━━━━━━━━━━━━━━━┷━━━━━━━━━━━━━━┛
 ```
-"""
+"""  # TODO: update this with command outputs when using SQL store.
             )
         )

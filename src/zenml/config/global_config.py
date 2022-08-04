@@ -152,6 +152,8 @@ class GlobalConfiguration(
         """
         self._config_path = config_path or self.default_config_directory()
         config_values = self._read_config()
+        if config_values.get(version, "0") < "0.13.0":
+            pass  # TODO: migrate old global configs to the new version?
         config_values.update(**kwargs)
         super().__init__(**config_values)
 
