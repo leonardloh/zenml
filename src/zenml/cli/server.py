@@ -15,11 +15,10 @@
 
 import ipaddress
 import os
-from typing import Any, Dict, Optional, Union
+from typing import TYPE_CHECKING, Any, Dict, Optional, Union
 
 import click
 import yaml
-from click_params import IP_ADDRESS  # type: ignore[import]
 from rich.errors import MarkupError
 
 from zenml.cli import utils as cli_utils
@@ -31,23 +30,16 @@ from zenml.enums import ServerProviderType, StoreType
 from zenml.logger import get_logger
 from zenml.utils import yaml_utils
 from zenml.utils.analytics_utils import AnalyticsEvent, track_event
-from zenml.zen_server.deploy.deployer import ServerDeployer
-from zenml.zen_server.deploy.deployment import (
-    ServerDeployment,
-    ServerDeploymentConfig,
-)
-from zenml.zen_server.deploy.exceptions import ServerDeploymentNotFoundError
-from zenml.zen_server.deploy.terraform.terraform_zen_server import (
-    TerraformServerDeploymentConfig,
-)
-from zenml.zen_stores.base_zen_store import DEFAULT_PASSWORD, DEFAULT_USERNAME
 
 logger = get_logger(__name__)
 
 LOCAL_ZENML_SERVER_NAME = "local"
 
+if TYPE_CHECKING:
+    from zenml.zen_server.deploy.deployment import ServerDeployment
 
-def get_active_deployment(local: bool = False) -> Optional[ServerDeployment]:
+
+def get_active_deployment(local: bool = False) -> Optional["ServerDeployment"]:
     """Get the active local or remote server deployment.
 
     Call this function to retrieve the local or remote server deployment that
@@ -60,6 +52,8 @@ def get_active_deployment(local: bool = False) -> Optional[ServerDeployment]:
         The local or remote active server deployment or None, if no deployment
         was found.
     """
+    from zenml.zen_server.deploy.deployer import ServerDeployer
+
     deployer = ServerDeployer()
     if local:
         servers = deployer.list_servers(provider_type=ServerProviderType.LOCAL)
@@ -92,6 +86,7 @@ def get_active_deployment(local: bool = False) -> Optional[ServerDeployment]:
     is_flag=True,
     help="Start the ZenML dashboard as a Docker container instead of a local "
     "process.",
+    default=False,
     type=click.BOOL,
 )
 @click.option(
@@ -102,7 +97,7 @@ def get_active_deployment(local: bool = False) -> Optional[ServerDeployment]:
 )
 @click.option(
     "--ip-address",
-    type=IP_ADDRESS,
+    type=ipaddress.ip_address,
     default=None,
     help="Have the ZenML dashboard listen on an IP address different than the "
     "localhost.",
@@ -112,7 +107,23 @@ def get_active_deployment(local: bool = False) -> Optional[ServerDeployment]:
     is_flag=True,
     help="Run the ZenML dashboard in blocking mode. The CLI will not return "
     "until the dashboard is stopped.",
+    default=False,
     type=click.BOOL,
+)
+@click.option(
+    "--connect",
+    is_flag=True,
+    help="Connect the client to the local server even when already connected "
+    "to a remote ZenML server.",
+    default=False,
+    type=click.BOOL,
+)
+@click.option(
+    "--image",
+    type=str,
+    default=None,
+    help="Use a custom Docker image for the ZenML server. Only used when "
+    "`--docker` is set.",
 )
 def up(
     docker: bool = False,
@@ -121,6 +132,8 @@ def up(
     ] = None,
     port: Optional[int] = None,
     blocking: bool = False,
+    connect: bool = False,
+    image: Optional[str] = None,
 ) -> None:
     """Start the ZenML dashboard locally and connect the client to it.
 
@@ -129,7 +142,16 @@ def up(
         ip_address: The IP address to bind the server to.
         port: The port to bind the server to.
         blocking: Block the CLI while the server is running.
+        connect: Connect the client to the local server even when already
+            connected to a remote ZenML server.
+        image: A custom Docker image to use for the server, when the
+            `--docker` flag is set.
     """
+    from zenml.zen_server.deploy.deployer import ServerDeployer
+    from zenml.zen_stores.sql_zen_store import SQLDatabaseDriver
+
+    gc = GlobalConfiguration()
+
     if docker:
         provider = ServerProviderType.DOCKER
     else:
@@ -147,36 +169,67 @@ def up(
     )
     if not docker:
         config_attrs["blocking"] = blocking
+    elif image:
+        config_attrs["image"] = image
     if port is not None:
         config_attrs["port"] = port
     if ip_address is not None:
         config_attrs["ip_address"] = ip_address
 
+    from zenml.zen_server.deploy.deployment import ServerDeploymentConfig
+
     server_config = ServerDeploymentConfig(**config_attrs)
 
     server = deployer.deploy_server(server_config)
 
-    gc = GlobalConfiguration()
     assert gc.store is not None
+
     track_event(
         AnalyticsEvent.ZENML_SERVER_STARTED,
         metadata={
             "server_id": str(gc.user_id),
             "server_deployment": str(provider),
-            "database_type": str(gc.store.type),
+            "database_type": SQLDatabaseDriver.SQLITE.value,
         },
     )
 
     if not blocking:
-        gc = GlobalConfiguration()
+        from zenml.zen_stores.base_zen_store import (
+            DEFAULT_PASSWORD,
+            DEFAULT_USERNAME,
+        )
+
         # Don't connect to the local server if the client is already connected
         # to a remote server.
-        if gc.zen_store.type == StoreType.REST:
-            cli_utils.declare(
-                "Skipped connecting to the local server. The client is "
-                "already connected to a remote ZenML server."
-            )
+        if (
+            gc.store is not None
+            and gc.store.type == StoreType.REST
+            and not connect
+        ):
+
+            try:
+                if gc.zen_store.is_local_store():
+                    connect = True
+                else:
+                    cli_utils.declare(
+                        "Skipped connecting to the local server. The client is "
+                        "already connected to a remote ZenML server. Pass the "
+                        "`--connect` flag to connect to the local server "
+                        "anyway."
+                    )
+            except Exception as e:
+                logger.debug(
+                    f"The current ZenML server configuration is no longer "
+                    f"valid. Connecting to the local server: {e}"
+                )
+                # even when connected to a remote ZenML server, if the
+                # connection is not working, we default to connecting to the
+                # local server
+                connect = True
         else:
+            connect = True
+
+        if connect:
             deployer.connect_to_server(
                 LOCAL_ZENML_SERVER_NAME,
                 DEFAULT_USERNAME,
@@ -199,17 +252,18 @@ def down() -> None:
         cli_utils.declare("The local ZenML dashboard is not running.")
         return
 
+    from zenml.zen_server.deploy.deployer import ServerDeployer
+
     deployer = ServerDeployer()
     deployer.remove_server(server.config.name)
 
     gc = GlobalConfiguration()
-    assert gc.store is not None
     track_event(
         AnalyticsEvent.ZENML_SERVER_STOPPED,
         metadata={
             "server_id": str(gc.user_id),
             "server_deployment": str(server.config.provider),
-            "database_type": str(gc.store.type),
+            "database_type": str(gc.store.type) if gc.store else "",
         },
     )
 
@@ -251,7 +305,7 @@ def down() -> None:
     "-t",
     type=click.INT,
     default=None,
-    help=("Time in seconds to wait for the server to be deployed."),
+    help="Time in seconds to wait for the server to be deployed.",
 )
 @click.option(
     "--config",
@@ -264,6 +318,7 @@ def down() -> None:
     is_flag=True,
     help="Connect your client to the ZenML server after it is successfully "
     "deployed.",
+    default=False,
     type=click.BOOL,
 )
 @click.option(
@@ -349,7 +404,11 @@ def deploy(
         password = click.prompt("ZenML admin account password", hide_input=True)
     config_dict["password"] = password
 
+    from zenml.zen_server.deploy.deployment import ServerDeploymentConfig
+
     server_config = ServerDeploymentConfig.parse_obj(config_dict)
+
+    from zenml.zen_server.deploy.deployer import ServerDeployer
 
     deployer = ServerDeployer()
 
@@ -376,6 +435,10 @@ def deploy(
     metadata = {
         "server_deployment": str(server.config.provider),
     }
+    from zenml.zen_server.deploy.terraform.terraform_zen_server import (
+        TerraformServerDeploymentConfig,
+    )
+
     if isinstance(server.config, TerraformServerDeploymentConfig):
         # TODO: maybe move the server ID into the ServerDeploymentConfig class
         metadata["server_id"] = str(server.config.server_id)
@@ -411,12 +474,18 @@ def destroy() -> None:
         cli_utils.declare("No cloud ZenML server has been deployed.")
         return
 
+    from zenml.zen_server.deploy.deployer import ServerDeployer
+
     deployer = ServerDeployer()
     deployer.remove_server(server.config.name)
 
     metadata = {
         "server_deployment": str(server.config.provider),
     }
+
+    from zenml.zen_server.deploy.terraform.terraform_zen_server import (
+        TerraformServerDeploymentConfig,
+    )
 
     if isinstance(server.config, TerraformServerDeploymentConfig):
         metadata["server_id"] = str(server.config.server_id)
@@ -502,6 +571,10 @@ def status() -> None:
             must be a path to a CA certificate bundle to use or the CA bundle
             value itself.
 
+        http_timeout: The number of seconds to wait for HTTP requests to the
+            ZenML server to be successful before issuing a timeout error
+            (default: 5).
+
     Example configuration:
 
         url: https://ac8ef63af203226194a7725ee71d85a-7635928635.us-east-1.elb.amazonaws.com/zenml\n
@@ -515,6 +588,7 @@ def status() -> None:
         ULnzA0JkRWRnFqH6uXeJo1KAVqtxn1xf8PYxx3NlNDr9wi8KKwARf2lwm6sH4mvq
         1aZ/0iYnGKCu7rLJzxeguliMf69E\n
         -----END CERTIFICATE-----
+        http_timeout: 10
 
     """
     ),
@@ -549,6 +623,7 @@ def status() -> None:
     "--no-verify-ssl",
     is_flag=True,
     help="Whether to verify the server's TLS certificate",
+    default=False,
 )
 @click.option(
     "--ssl-ca-cert",
@@ -566,7 +641,9 @@ def status() -> None:
 @click.option(
     "--raw-config",
     is_flag=True,
-    help="Whether to use the configuration without prompting for missing fields.",
+    help="Whether to use the configuration without prompting for missing "
+    "fields.",
+    default=False,
 )
 def connect(
     url: Optional[str] = None,
@@ -673,6 +750,8 @@ def connect(
 @cli.command("disconnect", help="Disconnect from a ZenML server.")
 def disconnect_server() -> None:
     """Disconnect from a ZenML server."""
+    from zenml.zen_server.deploy.deployer import ServerDeployer
+
     deployer = ServerDeployer()
     deployer.disconnect_from_server()
 
@@ -729,9 +808,15 @@ def logs(
         )
 
     server_name = server.config.name
+
+    from zenml.zen_server.deploy.deployer import ServerDeployer
+
     deployer = ServerDeployer()
 
     cli_utils.declare(f"Showing logs for server: {server_name}")
+
+    from zenml.zen_server.deploy.exceptions import ServerDeploymentNotFoundError
+
     try:
         logs = deployer.get_server_logs(server_name, follow=follow, tail=tail)
     except ServerDeploymentNotFoundError as e:
